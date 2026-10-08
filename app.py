@@ -1792,66 +1792,205 @@ def data_center(data):
     team_name = st.selectbox("Team represented in the source", team_names)
     gw = st.number_input("Gameweek represented", min_value=1, max_value=50, value=selected_gameweek(data["events"]))
 
-    uploaded = st.file_uploader(
-        "Upload screenshot / Excel / CSV",
+    uploaded_files = st.file_uploader(
+        "Upload screenshots / Excel / CSV (multiple files allowed)",
         type=["png", "jpg", "jpeg", "webp", "csv", "xlsx", "xls"],
-        accept_multiple_files=False,
+        accept_multiple_files=True,
         key="owner_enrichment_upload",
+        help="You can select multiple screenshots and/or owner data files in one upload.",
     )
 
-    if uploaded:
-        file_name = (uploaded.name or "").lower()
-        if file_name.endswith((".png", ".jpg", ".jpeg", ".webp")):
-            st.image(uploaded, caption="Uploaded source image", use_container_width=True)
-            if st.button("🤖 2. Analyze Image with Gemini", use_container_width=True):
-                with st.spinner("Gemini is extracting visible structured data..."):
-                    result, error = gemini_image_to_structured(uploaded, team_name, gw)
-                if error:
-                    st.error(error)
-                else:
-                    st.session_state["last_extracted_enrichment"] = result
+    if uploaded_files:
+        image_files = []
+        table_files = []
+        for f in uploaded_files:
+            name = (f.name or "").lower()
+            if name.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                image_files.append(f)
+            else:
+                table_files.append(f)
+
+        st.info(
+            f"{len(uploaded_files)} file(s) selected — "
+            f"{len(image_files)} image(s), {len(table_files)} table file(s)."
+        )
+
+        if image_files:
+            st.markdown("#### 🖼️ Image sources")
+            preview_cols = st.columns(min(3, len(image_files)))
+            for i, image_file in enumerate(image_files):
+                with preview_cols[i % len(preview_cols)]:
+                    st.image(
+                        image_file,
+                        caption=image_file.name,
+                        use_container_width=True,
+                    )
+
+            if st.button(
+                f"🤖 Analyze {len(image_files)} image(s) with Gemini",
+                use_container_width=True,
+                key="analyze_multiple_images",
+            ):
+                results = []
+                errors = []
+                with st.spinner(f"Gemini is analyzing {len(image_files)} image(s)..."):
+                    for image_file in image_files:
+                        result, error = gemini_image_to_structured(
+                            image_file,
+                            team_name,
+                            gw,
+                        )
+                        if error:
+                            errors.append(f"{image_file.name}: {error}")
+                        elif result:
+                            results.append({
+                                "file": image_file.name,
+                                "data": result,
+                            })
+
+                st.session_state["last_extracted_enrichment_results"] = results
+                st.session_state["last_extracted_enrichment_errors"] = errors
+
+                if results:
+                    merged = {}
+                    conflict_messages = []
+                    fields = [
+                        "left_vulnerability",
+                        "center_vulnerability",
+                        "right_vulnerability",
+                        "overall_vulnerability",
+                        "defensive_strength",
+                    ]
+
+                    for field in fields:
+                        values = []
+                        sources = []
+                        for item in results:
+                            value = item["data"].get(field)
+                            if value is not None and value != "":
+                                try:
+                                    numeric = float(value)
+                                    values.append(numeric)
+                                    sources.append(item["file"])
+                                except Exception:
+                                    pass
+
+                        if not values:
+                            merged[field] = None
+                        elif all(abs(v - values[0]) < 1e-9 for v in values):
+                            merged[field] = values[0]
+                        elif len(values) == 1:
+                            merged[field] = values[0]
+                        else:
+                            merged[field] = None
+                            conflict_messages.append(
+                                f"{field}: conflicting values {values} from {', '.join(sources)}"
+                            )
+
+                    # Non-numeric metadata: keep only a single unambiguous value.
+                    for field in ["team_name", "gameweek", "source_label", "confidence", "notes"]:
+                        vals = []
+                        for item in results:
+                            value = item["data"].get(field)
+                            if value is not None and str(value).strip():
+                                vals.append(str(value).strip())
+                        unique = list(dict.fromkeys(vals))
+                        merged[field] = unique[0] if len(unique) == 1 else ("; ".join(unique) if unique else None)
+
+                    if conflict_messages:
+                        merged["notes"] = (merged.get("notes") or "") + " | MULTI-IMAGE CONFLICTS: " + " || ".join(conflict_messages)
+
+                    st.session_state["last_extracted_enrichment"] = merged
                     st.session_state["last_extracted_team"] = team_name
                     st.session_state["last_extracted_gw"] = gw
-                    st.success("Image analyzed successfully. Review the extracted values below.")
-        else:
-            try:
-                owner_df = read_owner_table(uploaded)
-                if owner_df is None or owner_df.empty:
-                    st.warning("The uploaded table is empty.")
+
+                    st.success(
+                        f"Analyzed {len(results)} image(s). Review the combined extraction below."
+                    )
                 else:
-                    st.success(f"Loaded {len(owner_df)} owner-enrichment row(s).")
-                    st.dataframe(owner_df.head(50), use_container_width=True, hide_index=True)
+                    st.error("No image was successfully analyzed.")
 
-                    team_col = find_column(owner_df, ["team", "team_name", "club", "club_name"])
-                    left_col = find_column(owner_df, ["left", "left_vulnerability", "left_attack", "left_weakness"])
-                    center_col = find_column(owner_df, ["center", "centre", "center_vulnerability", "centre_vulnerability"])
-                    right_col = find_column(owner_df, ["right", "right_vulnerability", "right_attack", "right_weakness"])
-                    overall_col = find_column(owner_df, ["overall", "overall_vulnerability", "vulnerability"])
-                    strength_col = find_column(owner_df, ["defensive_strength", "defence_strength", "defense_strength"])
+                for msg in errors:
+                    st.error(msg)
 
-                    if not team_col:
-                        st.error("The table needs a Team / Team Name column before publishing.")
+        if table_files:
+            st.markdown("#### 📊 Table sources")
+            table_frames = []
+            table_errors = []
+            for table_file in table_files:
+                try:
+                    owner_df = read_owner_table(table_file)
+                    if owner_df is None or owner_df.empty:
+                        table_errors.append(f"{table_file.name}: file is empty.")
                     else:
-                        st.caption("The app auto-detects common column names. Missing metrics are left unchanged rather than invented.")
-                        if st.button("✅ 2. Publish Table Enrichment", use_container_width=True):
-                            enrichment = get_enrichment()
-                            published = 0
-                            for _, row in owner_df.iterrows():
-                                raw_team = str(row.get(team_col, "")).strip()
-                                team = next((t for t in data["teams"].values() if t["name"].lower() == raw_team.lower() or t["short_name"].lower() == raw_team.lower()), None)
-                                if not team:
-                                    continue
-                                item = enrichment.get(str(team["id"]), {})
-                                for key, col in [("left", left_col), ("center", center_col), ("right", right_col), ("vulnerability", overall_col), ("defensive_strength", strength_col)]:
-                                    if col and pd.notna(row.get(col)):
-                                        item[key] = clamp(safe_float(row.get(col)), 0, 100)
-                                item.update({"source": f"Owner file: {uploaded.name}", "confidence": "Owner data", "notes": "Published from owner CSV/Excel.", "gw": int(gw), "updated": utc_now(), "owner_enrichment": True})
-                                enrichment[str(team["id"])] = item
-                                published += 1
-                            set_enrichment(enrichment)
-                            st.success(f"Published enrichment for {published} team(s).")
-            except Exception as exc:
-                st.error(f"Could not read the owner table: {exc}")
+                        df = owner_df.copy()
+                        df["__source_file"] = table_file.name
+                        table_frames.append(df)
+                except Exception as exc:
+                    table_errors.append(f"{table_file.name}: {exc}")
+
+            if table_frames:
+                combined_df = pd.concat(table_frames, ignore_index=True)
+                st.success(f"Loaded {len(table_frames)} table file(s) with {len(combined_df)} total row(s).")
+                st.dataframe(combined_df.head(100), use_container_width=True, hide_index=True)
+
+                team_col = find_column(combined_df, ["team", "team_name", "club", "club_name"])
+                left_col = find_column(combined_df, ["left", "left_vulnerability", "left_attack", "left_weakness"])
+                center_col = find_column(combined_df, ["center", "centre", "center_vulnerability", "centre_vulnerability"])
+                right_col = find_column(combined_df, ["right", "right_vulnerability", "right_attack", "right_weakness"])
+                overall_col = find_column(combined_df, ["overall", "overall_vulnerability", "vulnerability"])
+                strength_col = find_column(combined_df, ["defensive_strength", "defence_strength", "defense_strength"])
+
+                if not team_col:
+                    st.error("The uploaded table files need a Team / Team Name column before publishing.")
+                else:
+                    st.caption("Common column names are auto-detected. Missing metrics are left unchanged rather than invented.")
+                    if st.button(
+                        f"✅ Publish {len(table_frames)} table file(s)",
+                        use_container_width=True,
+                        key="publish_multiple_tables",
+                    ):
+                        enrichment = get_enrichment()
+                        published = 0
+                        skipped = 0
+                        for _, row in combined_df.iterrows():
+                            raw_team = str(row.get(team_col, "")).strip()
+                            team = next(
+                                (
+                                    t for t in data["teams"].values()
+                                    if t["name"].lower() == raw_team.lower()
+                                    or t["short_name"].lower() == raw_team.lower()
+                                ),
+                                None,
+                            )
+                            if not team:
+                                skipped += 1
+                                continue
+                            item = enrichment.get(str(team["id"]), {})
+                            for key, col in [
+                                ("left", left_col),
+                                ("center", center_col),
+                                ("right", right_col),
+                                ("vulnerability", overall_col),
+                                ("defensive_strength", strength_col),
+                            ]:
+                                if col and pd.notna(row.get(col)):
+                                    item[key] = clamp(safe_float(row.get(col)), 0, 100)
+                            item.update({
+                                "source": f"Owner files: {len(table_frames)} file(s)",
+                                "confidence": "Owner data",
+                                "notes": "Published from multiple owner CSV/Excel files.",
+                                "gw": int(gw),
+                                "updated": utc_now(),
+                                "owner_enrichment": True,
+                            })
+                            enrichment[str(team["id"])] = item
+                            published += 1
+                        set_enrichment(enrichment)
+                        st.success(f"Published enrichment for {published} row(s). Skipped {skipped} unmatched row(s).")
+
+            for msg in table_errors:
+                st.error(msg)
 
     extracted = st.session_state.get(
         "last_extracted_enrichment"
